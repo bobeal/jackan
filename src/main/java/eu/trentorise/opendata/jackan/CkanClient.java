@@ -20,13 +20,11 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static eu.trentorise.opendata.commons.TodUtils.removeTrailingSlash;
 import static eu.trentorise.opendata.commons.validation.Preconditions.checkNotEmpty;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.UnsupportedEncodingException;
+import java.io.*;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
+import java.nio.charset.Charset;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,9 +37,11 @@ import java.util.logging.Logger;
 
 import javax.annotation.Nullable;
 
+import org.apache.http.HttpEntity;
 import org.apache.http.HttpHost;
 import org.apache.http.client.fluent.Request;
 import org.apache.http.client.fluent.Response;
+import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.utils.URIUtils;
 import org.apache.http.entity.ContentType;
 
@@ -78,6 +78,10 @@ import eu.trentorise.opendata.jackan.model.CkanUser;
 import eu.trentorise.opendata.jackan.model.CkanUserBase;
 import eu.trentorise.opendata.jackan.model.CkanVocabulary;
 import eu.trentorise.opendata.jackan.model.CkanVocabularyBase;
+import org.apache.http.entity.mime.MultipartEntityBuilder;
+import org.apache.http.entity.mime.content.FileBody;
+import org.apache.http.entity.mime.content.StringBody;
+import org.apache.http.protocol.HTTP;
 
 /**
  * Client to access a ckan instance. Threadsafe.
@@ -630,6 +634,60 @@ public class CkanClient {
 
     }
 
+    private <T extends CkanResponse> T postHttp(Class<T> responseType, String path, CkanResourceBase resource,
+                                                File fileBody, Object... params) {
+        checkNotNull(responseType);
+        checkNotNull(path);
+        checkNotNull(resource);
+        checkNotNull(fileBody);
+
+        String fullUrl = calcFullUrl(path, params);
+
+        T ckanResponse;
+        String returnedText;
+
+        try {
+            LOG.log(Level.FINE, "Posting to url {0}", fullUrl);
+            Request request = Request.Post(fullUrl);
+
+            configureRequest(request);
+
+            MultipartEntityBuilder entityBuilder = MultipartEntityBuilder.create()
+                .addBinaryBody("upload", fileBody, ContentType.create("application/octet-stream", Charset.forName("UTF-8")), fileBody.getName())
+                .addTextBody("id", resource.getId(), ContentType.TEXT_PLAIN)
+                .addTextBody("url", "upload", ContentType.TEXT_PLAIN)
+                .addTextBody("package_id", resource.getPackageId(), ContentType.TEXT_PLAIN);
+            if (resource.getLastModified() != null)
+                entityBuilder.addTextBody("last_modified", resource.getLastModified(), ContentType.TEXT_PLAIN);
+            entityBuilder.setCharset(Charset.forName("UTF-8"));
+
+            Response response = request.body(entityBuilder.build()).execute();
+
+            InputStream stream = response.returnResponse()
+                .getEntity()
+                .getContent();
+
+            try (InputStreamReader reader = new InputStreamReader(stream, Charsets.UTF_8)) {
+                returnedText = CharStreams.toString(reader);
+            }
+        } catch (Exception ex) {
+            throw new CkanException("Error while performing a POST! Request url is:" + fullUrl, this, ex);
+        }
+
+        try {
+            ckanResponse = getObjectMapper().readValue(returnedText, responseType);
+        } catch (Exception ex) {
+            throw new CkanException(
+                "Couldn't interpret json returned by the server! Returned text was: " + returnedText, this, ex);
+        }
+
+        if (!ckanResponse.isSuccess()) {
+            throwCkanException("Error while performing a POST! Request url is:" + fullUrl, ckanResponse);
+        }
+        return ckanResponse;
+
+    }
+
     /**
      * Returns the catalog URL (normalized).
      */
@@ -1005,6 +1063,13 @@ public class CkanClient {
         return postHttp(ResourceResponse.class, "/api/3/action/resource_update", json,
                 ContentType.APPLICATION_JSON).result;
 
+    }
+
+    public synchronized CkanResource updateResourceData(CkanResourceBase resource, File dataFile) {
+        checkNotNull(dataFile, "Need a non empty file");
+        checkToken("Tried to update resource" + resource.getName());
+
+        return postHttp(ResourceResponse.class, "/api/3/action/resource_update", resource, dataFile).result;
     }
 
     /**
